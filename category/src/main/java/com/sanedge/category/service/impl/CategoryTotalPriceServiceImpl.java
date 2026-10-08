@@ -1,0 +1,178 @@
+package com.sanedge.category.service.impl;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sanedge.common.config.RedisService;
+import com.sanedge.category.domain.requests.MonthTotalPriceRequest;
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.category.domain.response.CategoriesMonthlyTotalPriceResponse;
+import com.sanedge.category.domain.response.CategoriesYearlyTotalPriceResponse;
+import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.category.repository.stats.CategoryTotalPriceRepository;
+import com.sanedge.category.service.stats.CategoryTotalPriceService;
+import com.sanedge.common.observability.TracingMetrics;
+
+import io.opentelemetry.api.common.Attributes;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+@ApplicationScoped
+public class CategoryTotalPriceServiceImpl implements CategoryTotalPriceService {
+        private static final Logger logger = LoggerFactory.getLogger(CategoryTotalPriceServiceImpl.class);
+
+        private final CategoryTotalPriceRepository categoryTotalPriceRepository;
+        private final RedisService redisService;
+        private final ObjectMapper objectMapper;
+        private final TracingMetrics tracingMetrics;
+
+        private static final long STATS_CACHE_TTL_SECONDS = 300;
+
+        @Inject
+        public CategoryTotalPriceServiceImpl(CategoryTotalPriceRepository categoryTotalPriceRepository,
+                        RedisService redisService,
+                        ObjectMapper objectMapper,
+                        TracingMetrics tracingMetrics) {
+                this.categoryTotalPriceRepository = categoryTotalPriceRepository;
+                this.redisService = redisService;
+                this.objectMapper = objectMapper;
+                this.tracingMetrics = tracingMetrics;
+        }
+
+        private String toJson(Object obj) {
+                try {
+                        return objectMapper.writeValueAsString(obj);
+                } catch (JsonProcessingException e) {
+                        logger.error("Error serializing object to JSON", e);
+                        throw new RuntimeException("Failed to serialize object", e);
+                }
+        }
+
+        private <T> T fromJson(String json, TypeReference<T> typeReference) {
+                try {
+                        return objectMapper.readValue(json, typeReference);
+                } catch (JsonProcessingException e) {
+                        logger.error("Error deserializing JSON to object with TypeReference", e);
+                        throw new RuntimeException("Failed to deserialize JSON", e);
+                }
+        }
+
+        @Override
+        public Uni<ApiResponse<List<CategoriesMonthlyTotalPriceResponse>>> findMonthlyTotalPrice(
+                        MonthTotalPriceRequest req) {
+                if (req.getYear() == null || req.getMonth() == null) {
+                        logger.error("Year or Month is null | req: {}", req);
+                        throw new ResourceNotFoundException("Year and Month must not be null");
+                }
+
+                String cacheKey = String.format("categories:stats:monthly-total-price:%d:%d", req.getYear(),
+                                req.getMonth());
+
+                Attributes attrs = Attributes.builder()
+                                .put("stats.year", req.getYear())
+                                .put("stats.month", req.getMonth())
+                                .build();
+
+                return redisService.getReactive(cacheKey)
+                                .chain(cachedJson -> {
+                                        if (cachedJson != null) {
+                                                logger.info("Cache HIT for key: {}", cacheKey);
+                                                ApiResponse<List<CategoriesMonthlyTotalPriceResponse>> response = fromJson(
+                                                                cachedJson,
+                                                                new TypeReference<ApiResponse<List<CategoriesMonthlyTotalPriceResponse>>>() {
+                                                                });
+                                                return Uni.createFrom().item(response);
+                                        }
+
+                                        logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+                                        return tracingMetrics.traceAndMeasure("findMonthlyTotalPrice",
+                                                        "find_monthly_total_price_stats", attrs,
+                                                        () -> categoryTotalPriceRepository
+                                                                        .findMonthlyTotalPrice(req.getYear(),
+                                                                                        req.getMonth())
+                                                                        .chain(results -> {
+                                                                                List<CategoriesMonthlyTotalPriceResponse> responseList = results
+                                                                                                .stream()
+                                                                                                .map(CategoriesMonthlyTotalPriceResponse::from)
+                                                                                                .collect(Collectors
+                                                                                                                .toList());
+
+                                                                                ApiResponse<List<CategoriesMonthlyTotalPriceResponse>> response = ApiResponse
+                                                                                                .success(
+                                                                                                                "Monthly total price stats retrieved successfully",
+                                                                                                                responseList);
+
+                                                                                return redisService
+                                                                                                .setWithExpirationReactive(
+                                                                                                                cacheKey,
+                                                                                                                toJson(response),
+                                                                                                                STATS_CACHE_TTL_SECONDS)
+                                                                                                .map(v -> {
+                                                                                                        logger.info("Cached monthly total price stats for key: {}",
+                                                                                                                        cacheKey);
+                                                                                                        logger.info("Successfully fetched {} monthly total price stats",
+                                                                                                                        responseList.size());
+                                                                                                        return response;
+                                                                                                });
+                                                                        }));
+                                });
+        }
+
+        @Override
+        public Uni<ApiResponse<List<CategoriesYearlyTotalPriceResponse>>> findYearlyTotalPrice(Integer year) {
+                String cacheKey = "categories:stats:yearly-total-price:" + year;
+
+                Attributes attrs = Attributes.builder()
+                                .put("stats.year", year)
+                                .build();
+
+                return redisService.getReactive(cacheKey)
+                                .chain(cachedJson -> {
+                                        if (cachedJson != null) {
+                                                logger.info("Cache HIT for key: {}", cacheKey);
+                                                ApiResponse<List<CategoriesYearlyTotalPriceResponse>> response = fromJson(
+                                                                cachedJson,
+                                                                new TypeReference<ApiResponse<List<CategoriesYearlyTotalPriceResponse>>>() {
+                                                                });
+                                                return Uni.createFrom().item(response);
+                                        }
+
+                                        logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+                                        return tracingMetrics.traceAndMeasure("findYearlyTotalPrice",
+                                                        "find_yearly_total_price_stats", attrs,
+                                                        () -> categoryTotalPriceRepository.findYearlyTotalPrice(year)
+                                                                        .chain(results -> {
+                                                                                List<CategoriesYearlyTotalPriceResponse> responseList = results
+                                                                                                .stream()
+                                                                                                .map(CategoriesYearlyTotalPriceResponse::from)
+                                                                                                .collect(Collectors
+                                                                                                                .toList());
+
+                                                                                ApiResponse<List<CategoriesYearlyTotalPriceResponse>> response = ApiResponse
+                                                                                                .success(
+                                                                                                                "Yearly total price stats retrieved successfully",
+                                                                                                                responseList);
+
+                                                                                return redisService
+                                                                                                .setWithExpirationReactive(
+                                                                                                                cacheKey,
+                                                                                                                toJson(response),
+                                                                                                                STATS_CACHE_TTL_SECONDS)
+                                                                                                .map(v -> {
+                                                                                                        logger.info("Cached yearly total price stats for key: {}",
+                                                                                                                        cacheKey);
+                                                                                                        logger.info("Successfully fetched {} yearly total price stats",
+                                                                                                                        responseList.size());
+                                                                                                        return response;
+                                                                                                });
+                                                                        }));
+                                });
+        }
+}
